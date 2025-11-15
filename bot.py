@@ -63,7 +63,7 @@ class ArbitrageBot:
     def __init__(self):
         self.strategies = [ArbitrageBotStrategy(s.get('entry_diff'), s.get('exit_diff'), s.get('name'), s.get('safety_timeout')) for s in STRATEGIES]
         self.candidate_coins = []
-        self.CANDIDATE_TRACK_TIME = 2 * 60
+        self.CANDIDATE_TRACK_TIME = 2 * 60  # always 2 minutes
         self.candidate_track_start = None
         self.SPOT_FEE_RATE = 0.001
         self.FUTURES_FEE_RATE = 0.0004
@@ -88,15 +88,13 @@ class ArbitrageBot:
     def fetch_batch_prices(self, url, symbol_list, price_dict):
         params = {"symbols": f'["{"\",\"".join(symbol_list)}"]'}
         try:
-            start_time = time.perf_counter()
             resp = requests.get(url, params=params, timeout=5)
             resp.raise_for_status()
             data = resp.json()
             for entry in data:
                 sym = entry["symbol"]
                 price_dict[sym] = {"bid": float(entry["bidPrice"]), "ask": float(entry["askPrice"])}
-            elapsed = time.perf_counter() - start_time
-            print(f"[{datetime.now()}] Batch fetch {len(symbol_list)} symbols took {elapsed:.3f} sec")
+            # Removed detailed batch timing logs to reduce noise
         except Exception as e:
             print(f"[{datetime.now()}] Warning: Failed to fetch batch prices from {url} symbols count {len(symbol_list)}: {e}")
 
@@ -146,6 +144,7 @@ class ArbitrageBot:
             print("No arbitrage candidates found.")
             self.candidate_coins = []
             self.candidate_track_start = None
+            # Immediately after no candidates, full scan will happen again in monitor loop
 
     def open_trade(self, strategy, coin):
         sym = coin["symbol"]
