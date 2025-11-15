@@ -16,29 +16,8 @@ STRATEGIES = [
 ]
 
 MAX_BATCH_SIZE = 50
-
-class RateLimiter:
-    def __init__(self, max_calls, per_seconds):
-        self.max_calls = max_calls
-        self.per_seconds = per_seconds
-        self.allowance = max_calls
-        self.last_check = time.monotonic()
-
-    def wait(self):
-        current = time.monotonic()
-        time_passed = current - self.last_check
-        self.last_check = current
-        self.allowance += time_passed * (self.max_calls / self.per_seconds)
-        if self.allowance > self.max_calls:
-            self.allowance = self.max_calls
-        if self.allowance < 1.0:
-            sleep_time = (1.0 - self.allowance) * (self.per_seconds / self.max_calls)
-            time.sleep(sleep_time)
-            self.allowance = 0
-        else:
-            self.allowance -= 1.0
-
-rate_limiter = RateLimiter(max_calls=1200, per_seconds=60)  # Binance rate limit
+MAX_CALLS_PER_SECOND = 18
+CALL_DELAY = 1.0 / MAX_CALLS_PER_SECOND
 
 def upload_to_gdrive(local_file_path):
     try:
@@ -86,6 +65,7 @@ class ArbitrageBot:
         self.candidate_coins = []
         self.CANDIDATE_TRACK_TIME = 2 * 60
         self.candidate_track_start = None
+        self.last_full_scan_time = None
         self.SPOT_FEE_RATE = 0.001
         self.FUTURES_FEE_RATE = 0.0004
         self.TRADE_AMOUNT_USD = 100
@@ -101,11 +81,12 @@ class ArbitrageBot:
     def fetch_symbols(self):
         spot_info = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=5).json()
         futures_info = requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=5).json()
-        self.spot_symbols = [s["symbol"] for s in spot_info["symbols"] if s["status"] == "TRADING" and s["quoteAsset"] == "USDT"]
-        self.futures_symbols = [s["symbol"] for s in futures_info["symbols"] if s["contractType"] == "PERPETUAL" and s["status"] == "TRADING" and s["quoteAsset"] == "USDT"]
+        self.spot_symbols = [s["symbol"] for s in spot_info["symbols"]
+                             if s["status"] == "TRADING" and s["quoteAsset"] == "USDT"]
+        self.futures_symbols = [s["symbol"] for s in futures_info["symbols"]
+                               if s["contractType"] == "PERPETUAL" and s["status"] == "TRADING" and s["quoteAsset"] == "USDT"]
 
     def fetch_batch_prices(self, url, symbol_list, price_dict):
-        rate_limiter.wait()
         params = {"symbols": f'["{"\",\"".join(symbol_list)}"]'}
         try:
             resp = requests.get(url, params=params, timeout=5)
@@ -120,7 +101,7 @@ class ArbitrageBot:
     def fetch_prices(self):
         def chunks(lst, n):
             for i in range(0, len(lst), n):
-                yield lst[i:i+n]
+                yield lst[i:i + n]
 
         spot_url = "https://api.binance.com/api/v3/ticker/bookTicker"
         futures_url = "https://fapi.binance.com/fapi/v1/ticker/bookTicker"
@@ -128,11 +109,13 @@ class ArbitrageBot:
         spot_batches = list(chunks(self.spot_symbols, MAX_BATCH_SIZE))
         futures_batches = list(chunks(self.futures_symbols, MAX_BATCH_SIZE))
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        with ThreadPoolExecutor(max_workers=10) as executor:
             for batch in spot_batches:
                 executor.submit(self.fetch_batch_prices, spot_url, batch, self.spot_prices)
+                time.sleep(CALL_DELAY)
             for batch in futures_batches:
                 executor.submit(self.fetch_batch_prices, futures_url, batch, self.futures_prices)
+                time.sleep(CALL_DELAY)
 
     def full_market_scan(self):
         now = datetime.now()
@@ -157,10 +140,12 @@ class ArbitrageBot:
                 print(f"  {c['symbol']} | Spot ask: {c['spot_price']:.5f}, Futures bid: {c['futures_price']:.5f}, Diff%: {c['diff']:.4f}")
             self.candidate_coins = candidates
             self.candidate_track_start = now
+            self.last_full_scan_time = now
         else:
             print("No arbitrage candidates found.")
             self.candidate_coins = []
-            self.candidate_track_start = None
+            self.candidate_track_start = now
+            self.last_full_scan_time = now
 
     def open_trade(self, strategy, coin):
         sym = coin["symbol"]
@@ -302,7 +287,12 @@ class ArbitrageBot:
                         continue
                     else:
                         elapsed = (now - self.candidate_track_start).total_seconds() if self.candidate_track_start else 0
-                        if elapsed > self.CANDIDATE_TRACK_TIME:
+                        # Enforce cooldown between full scans to 2 minutes
+                        if self.last_full_scan_time:
+                            diff_since_last_scan = (now - self.last_full_scan_time).total_seconds()
+                        else:
+                            diff_since_last_scan = None
+                        if elapsed > self.CANDIDATE_TRACK_TIME and (diff_since_last_scan is None or diff_since_last_scan >= self.CANDIDATE_TRACK_TIME):
                             print(f"{now} Candidate tracking expired, rescanning full market")
                             self.full_market_scan()
                             continue
