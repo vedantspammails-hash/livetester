@@ -15,6 +15,10 @@ STRATEGIES = [
     {'name': 'Strategy_5', 'entry_diff': 0.25,  'exit_diff': -0.25, 'safety_timeout': 60 * 60}
 ]
 
+MAX_BATCH_SIZE = 50
+MAX_CALLS_PER_SECOND = 18  # Binance API rate limit safe pace
+CALL_DELAY = 1.0 / MAX_CALLS_PER_SECOND
+
 def upload_to_gdrive(local_file_path):
     try:
         gauth = GoogleAuth()
@@ -84,12 +88,15 @@ class ArbitrageBot:
     def fetch_batch_prices(self, url, symbol_list, price_dict):
         params = {"symbols": f'["{"\",\"".join(symbol_list)}"]'}
         try:
+            start_time = time.perf_counter()
             resp = requests.get(url, params=params, timeout=5)
             resp.raise_for_status()
             data = resp.json()
             for entry in data:
                 sym = entry["symbol"]
                 price_dict[sym] = {"bid": float(entry["bidPrice"]), "ask": float(entry["askPrice"])}
+            elapsed = time.perf_counter() - start_time
+            print(f"[{datetime.now()}] Batch fetch {len(symbol_list)} symbols took {elapsed:.3f} sec")
         except Exception as e:
             print(f"[{datetime.now()}] Warning: Failed to fetch batch prices from {url} symbols count {len(symbol_list)}: {e}")
 
@@ -97,19 +104,20 @@ class ArbitrageBot:
         def chunks(lst, n):
             for i in range(0, len(lst), n):
                 yield lst[i:i + n]
+
         spot_url = "https://api.binance.com/api/v3/ticker/bookTicker"
         futures_url = "https://fapi.binance.com/fapi/v1/ticker/bookTicker"
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            spot_batches = list(chunks(self.spot_symbols, 50))
-            futures_batches = list(chunks(self.futures_symbols, 50))
-            spot_futures = [executor.submit(self.fetch_batch_prices, spot_url, batch, self.spot_prices) for batch in spot_batches]
-            futures_futures = [executor.submit(self.fetch_batch_prices, futures_url, batch, self.futures_prices) for batch in futures_batches]
-            for f in spot_futures:
-                f.result()
-                time.sleep(0.01)
-            for f in futures_futures:
-                f.result()
-                time.sleep(0.01)
+
+        spot_batches = list(chunks(self.spot_symbols, MAX_BATCH_SIZE))
+        futures_batches = list(chunks(self.futures_symbols, MAX_BATCH_SIZE))
+
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            for batch in spot_batches:
+                executor.submit(self.fetch_batch_prices, spot_url, batch, self.spot_prices)
+                time.sleep(CALL_DELAY)
+            for batch in futures_batches:
+                executor.submit(self.fetch_batch_prices, futures_url, batch, self.futures_prices)
+                time.sleep(CALL_DELAY)
 
     def full_market_scan(self):
         now = datetime.now()
@@ -303,6 +311,7 @@ class ArbitrageBot:
             print("Exiting and saving logs...")
             for strategy in self.strategies:
                 self.save_logs(strategy)
+
 
 if __name__ == "__main__":
     bot = ArbitrageBot()
