@@ -1,6 +1,6 @@
 import requests
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -8,7 +8,8 @@ from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 
 def now_ist():
-    return datetime.utcnow() + timedelta(hours=5, minutes=30)
+    # Timezone-aware IST time
+    return datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
 
 STRATEGIES = [
     {'name': 'Strategy_1', 'entry_diff': 0.30,  'exit_diff': 0.0},
@@ -25,7 +26,8 @@ def upload_to_gdrive(local_file_path):
         gauth = GoogleAuth()
         gauth.LoadCredentialsFile("mycreds.txt")
         if gauth.credentials is None:
-            gauth.LocalWebserverAuth()
+            # Use CommandLineAuth for headless/cloud environments
+            gauth.CommandLineAuth()
         elif gauth.access_token_expired:
             gauth.Refresh()
         else:
@@ -56,7 +58,7 @@ class ArbitrageBotStrategy:
         self.entry_diff = entry_diff
         self.exit_diff = exit_diff
         self.strategy_name = strategy_name
-        self.positions = {}
+        self.positions = {}  # key: symbol, value: position dict
         self.trade_log = []
         self.safety_timeout = safety_timeout or 30 * 60
 
@@ -64,7 +66,7 @@ class ArbitrageBot:
     def __init__(self):
         self.strategies = [ArbitrageBotStrategy(s.get('entry_diff'), s.get('exit_diff'), s.get('name'), s.get('safety_timeout')) for s in STRATEGIES]
         self.candidate_coins = []
-        self.CANDIDATE_TRACK_TIME = 2 * 60
+        self.CANDIDATE_TRACK_TIME = 2 * 60  # seconds
         self.candidate_track_start = None
         self.last_full_scan_time = None
         self.SPOT_FEE_RATE = 0.001
@@ -78,7 +80,7 @@ class ArbitrageBot:
 
         self.spot_prices = {}
         self.futures_prices = {}
-        self.watchlist = set()  # Symbols to monitor prices for in current phase
+        self.watchlist = set()
 
     def fetch_symbols(self):
         spot_info = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=5).json()
@@ -105,16 +107,15 @@ class ArbitrageBot:
             for i in range(0, len(lst), n):
                 yield lst[i:i + n]
 
-        # Build watchlist for current monitoring phase
         trade_symbols = set()
         for strategy in self.strategies:
             trade_symbols.update(strategy.positions.keys())
 
         if self.candidate_coins:
-            # During candidate tracking phase: track all candidates + open trades
+            # Track all candidates + open trades during candidate tracking
             watchlist = set([c['symbol'] for c in self.candidate_coins]) | trade_symbols
         else:
-            # Otherwise full scan phase: monitor all futures symbols
+            # Full market scan phase watch all futures symbols
             watchlist = set(self.futures_symbols)
 
         self.watchlist = watchlist
@@ -131,7 +132,7 @@ class ArbitrageBot:
         with ThreadPoolExecutor(max_workers=10) as executor:
             for batch in spot_batches:
                 executor.submit(self.fetch_batch_prices, spot_url, batch, self.spot_prices)
-                time.sleep(1.0 / 18)
+                time.sleep(1.0 / 18)  # Respect API limits
             for batch in futures_batches:
                 executor.submit(self.fetch_batch_prices, futures_url, batch, self.futures_prices)
                 time.sleep(1.0 / 18)
@@ -167,6 +168,10 @@ class ArbitrageBot:
             self.last_full_scan_time = now
 
     def open_trade(self, strategy, coin):
+        # Block new trade if strategy already has ANY open position
+        if strategy.positions:
+            return
+
         sym = coin["symbol"]
         spot_price = coin["spot_price"]
         fut_price = coin["futures_price"]
@@ -276,7 +281,6 @@ class ArbitrageBot:
         while not self.stop_event.is_set():
             now = now_ist()
 
-            # Check candidate tracking window state
             in_candidate_tracking = False
             if self.candidate_coins and self.candidate_track_start:
                 elapsed = (now - self.candidate_track_start).total_seconds()
@@ -287,7 +291,6 @@ class ArbitrageBot:
                     self.candidate_coins = []
                     self.candidate_track_start = None
 
-            # Fetch prices - will adapt watchlist based on current state
             self.fetch_prices()
 
             if (now - premium_print_timer).total_seconds() >= 2:
@@ -301,13 +304,11 @@ class ArbitrageBot:
                 premium_print_timer = now
 
             if not in_candidate_tracking:
-                # Full scan phase: find candidates, loop continues to track them next
                 self.full_market_scan()
                 continue
 
-            # Candidate tracking phase: monitor candidates AND open trades concurrently
             for strategy in self.strategies:
-                # Check existing open positions for exit conditions
+                # Close trades if exit or safety timeout triggered
                 if strategy.positions:
                     for sym in list(strategy.positions.keys()):
                         sp = self.spot_prices.get(sym)
@@ -322,8 +323,8 @@ class ArbitrageBot:
                                 print(f"[{strategy.strategy_name}] {now} | Safety timeout reached on {sym}, exiting trade.")
                                 self.close_trade(strategy, sym)
 
-                # For candidates without open trades, check entry conditions and open trades
-                else:
+                # Open trades only if no open position in strategy (one position max)
+                elif not strategy.positions:
                     for c in self.candidate_coins:
                         sym = c["symbol"]
                         sp = self.spot_prices.get(sym)
@@ -332,16 +333,14 @@ class ArbitrageBot:
                             continue
                         diff_pct = (fp["bid"] - sp["ask"]) / sp["ask"] * 100
                         if diff_pct >= strategy.entry_diff:
-                            # Ensure no open trade on this symbol for this strategy before entry
-                            if sym not in strategy.positions:
-                                print(f"[{strategy.strategy_name}] {now} | Opening trade on {sym}, premium {diff_pct:.4f}%")
-                                self.open_trade(strategy, {
-                                    "symbol": sym,
-                                    "spot_price": sp["ask"],
-                                    "futures_price": fp["bid"],
-                                    "diff": diff_pct
-                                })
-                                break
+                            print(f"[{strategy.strategy_name}] {now} | Opening trade on {sym}, premium {diff_pct:.4f}%")
+                            self.open_trade(strategy, {
+                                "symbol": sym,
+                                "spot_price": sp["ask"],
+                                "futures_price": fp["bid"],
+                                "diff": diff_pct
+                            })
+                            break
 
             time.sleep(0.01)
 
