@@ -16,8 +16,29 @@ STRATEGIES = [
 ]
 
 MAX_BATCH_SIZE = 50
-MAX_CALLS_PER_SECOND = 18  # Binance API rate limit safe pace
-CALL_DELAY = 1.0 / MAX_CALLS_PER_SECOND
+
+class RateLimiter:
+    def __init__(self, max_calls, per_seconds):
+        self.max_calls = max_calls
+        self.per_seconds = per_seconds
+        self.allowance = max_calls
+        self.last_check = time.monotonic()
+
+    def wait(self):
+        current = time.monotonic()
+        time_passed = current - self.last_check
+        self.last_check = current
+        self.allowance += time_passed * (self.max_calls / self.per_seconds)
+        if self.allowance > self.max_calls:
+            self.allowance = self.max_calls
+        if self.allowance < 1.0:
+            sleep_time = (1.0 - self.allowance) * (self.per_seconds / self.max_calls)
+            time.sleep(sleep_time)
+            self.allowance = 0
+        else:
+            self.allowance -= 1.0
+
+rate_limiter = RateLimiter(max_calls=1200, per_seconds=60)  # Binance rate limit
 
 def upload_to_gdrive(local_file_path):
     try:
@@ -63,7 +84,7 @@ class ArbitrageBot:
     def __init__(self):
         self.strategies = [ArbitrageBotStrategy(s.get('entry_diff'), s.get('exit_diff'), s.get('name'), s.get('safety_timeout')) for s in STRATEGIES]
         self.candidate_coins = []
-        self.CANDIDATE_TRACK_TIME = 2 * 60  # 2 minutes full scan interval
+        self.CANDIDATE_TRACK_TIME = 2 * 60
         self.candidate_track_start = None
         self.SPOT_FEE_RATE = 0.001
         self.FUTURES_FEE_RATE = 0.0004
@@ -80,12 +101,11 @@ class ArbitrageBot:
     def fetch_symbols(self):
         spot_info = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=5).json()
         futures_info = requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=5).json()
-        self.spot_symbols = [s["symbol"] for s in spot_info["symbols"]
-                             if s["status"] == "TRADING" and s["quoteAsset"] == "USDT"]
-        self.futures_symbols = [s["symbol"] for s in futures_info["symbols"]
-                               if s["contractType"] == "PERPETUAL" and s["status"] == "TRADING" and s["quoteAsset"] == "USDT"]
+        self.spot_symbols = [s["symbol"] for s in spot_info["symbols"] if s["status"] == "TRADING" and s["quoteAsset"] == "USDT"]
+        self.futures_symbols = [s["symbol"] for s in futures_info["symbols"] if s["contractType"] == "PERPETUAL" and s["status"] == "TRADING" and s["quoteAsset"] == "USDT"]
 
     def fetch_batch_prices(self, url, symbol_list, price_dict):
+        rate_limiter.wait()
         params = {"symbols": f'["{"\",\"".join(symbol_list)}"]'}
         try:
             resp = requests.get(url, params=params, timeout=5)
@@ -100,7 +120,7 @@ class ArbitrageBot:
     def fetch_prices(self):
         def chunks(lst, n):
             for i in range(0, len(lst), n):
-                yield lst[i:i + n]
+                yield lst[i:i+n]
 
         spot_url = "https://api.binance.com/api/v3/ticker/bookTicker"
         futures_url = "https://fapi.binance.com/fapi/v1/ticker/bookTicker"
@@ -108,13 +128,11 @@ class ArbitrageBot:
         spot_batches = list(chunks(self.spot_symbols, MAX_BATCH_SIZE))
         futures_batches = list(chunks(self.futures_symbols, MAX_BATCH_SIZE))
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=5) as executor:
             for batch in spot_batches:
                 executor.submit(self.fetch_batch_prices, spot_url, batch, self.spot_prices)
-                time.sleep(CALL_DELAY)
             for batch in futures_batches:
                 executor.submit(self.fetch_batch_prices, futures_url, batch, self.futures_prices)
-                time.sleep(CALL_DELAY)
 
     def full_market_scan(self):
         now = datetime.now()
@@ -254,7 +272,6 @@ class ArbitrageBot:
         while not self.stop_event.is_set():
             now = datetime.now()
             self.fetch_prices()
-            # Print premium difference every 2 seconds
             if (now - premium_print_timer).total_seconds() >= 2:
                 print(f"\n[{now}] Candidate premium differences:")
                 for c in self.candidate_coins:
@@ -318,7 +335,6 @@ class ArbitrageBot:
             print("Exiting and saving logs...")
             for strategy in self.strategies:
                 self.save_logs(strategy)
-
 
 if __name__ == "__main__":
     bot = ArbitrageBot()
