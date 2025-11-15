@@ -11,11 +11,11 @@ def now_ist():
     return datetime.utcnow() + timedelta(hours=5, minutes=30)
 
 STRATEGIES = [
-    {'name': 'Strategy_1', 'entry_diff': 0.30,  'exit_diff': 0.0},
-    {'name': 'Strategy_2', 'entry_diff': 0.20,  'exit_diff': -0.20},
-    {'name': 'Strategy_3', 'entry_diff': 0.20,  'exit_diff': -0.25},
-    {'name': 'Strategy_4', 'entry_diff': 0.12,  'exit_diff': -0.24},
-    {'name': 'Strategy_5', 'entry_diff': 0.25,  'exit_diff': -0.25, 'safety_timeout': 60 * 60}
+    {'name': 'Strategy_1', 'entry_diff': 0.30, 'exit_diff': 0.0},
+    {'name': 'Strategy_2', 'entry_diff': 0.20, 'exit_diff': -0.20},
+    {'name': 'Strategy_3', 'entry_diff': 0.20, 'exit_diff': -0.25},
+    {'name': 'Strategy_4', 'entry_diff': 0.12, 'exit_diff': -0.24},
+    {'name': 'Strategy_5', 'entry_diff': 0.25, 'exit_diff': -0.25, 'safety_timeout': 60 * 60}
 ]
 
 MAX_BATCH_SIZE = 50
@@ -98,22 +98,29 @@ class ArbitrageBot:
             print(f"[{now_ist()}] Warning: Failed to fetch batch prices from {url} symbols count {len(symbol_list)}: {e}")
 
     def fetch_prices(self):
+        watch_symbols_set = set()
+        for strategy in self.strategies:
+            watch_symbols_set.update(strategy.positions.keys())
+        watch_symbols_set.update([c['symbol'] for c in self.candidate_coins])
+        if not watch_symbols_set:
+            return
+        watch_symbols = list(watch_symbols_set)
+        spot_watch = [sym for sym in watch_symbols if sym in self.spot_symbols]
+        futures_watch = [sym for sym in watch_symbols if sym in self.futures_symbols]
+
         def chunks(lst, n):
             for i in range(0, len(lst), n):
                 yield lst[i:i + n]
 
-        spot_url = "https://api.binance.com/api/v3/ticker/bookTicker"
-        futures_url = "https://fapi.binance.com/fapi/v1/ticker/bookTicker"
-
-        spot_batches = list(chunks(self.spot_symbols, MAX_BATCH_SIZE))
-        futures_batches = list(chunks(self.futures_symbols, MAX_BATCH_SIZE))
+        spot_batches = list(chunks(spot_watch, MAX_BATCH_SIZE))
+        futures_batches = list(chunks(futures_watch, MAX_BATCH_SIZE))
 
         with ThreadPoolExecutor(max_workers=10) as executor:
             for batch in spot_batches:
-                executor.submit(self.fetch_batch_prices, spot_url, batch, self.spot_prices)
-                time.sleep(1.0 / 18)  # Delay to respect rate limits
+                executor.submit(self.fetch_batch_prices, "https://api.binance.com/api/v3/ticker/bookTicker", batch, self.spot_prices)
+                time.sleep(1.0 / 18)
             for batch in futures_batches:
-                executor.submit(self.fetch_batch_prices, futures_url, batch, self.futures_prices)
+                executor.submit(self.fetch_batch_prices, "https://fapi.binance.com/fapi/v1/ticker/bookTicker", batch, self.futures_prices)
                 time.sleep(1.0 / 18)
 
     def full_market_scan(self):
