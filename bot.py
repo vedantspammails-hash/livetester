@@ -63,7 +63,7 @@ class ArbitrageBot:
     def __init__(self):
         self.strategies = [ArbitrageBotStrategy(s.get('entry_diff'), s.get('exit_diff'), s.get('name'), s.get('safety_timeout')) for s in STRATEGIES]
         self.candidate_coins = []
-        self.CANDIDATE_TRACK_TIME = 2 * 60  # always 2 minutes
+        self.CANDIDATE_TRACK_TIME = 2 * 60  # 2 minutes full scan interval
         self.candidate_track_start = None
         self.SPOT_FEE_RATE = 0.001
         self.FUTURES_FEE_RATE = 0.0004
@@ -94,7 +94,6 @@ class ArbitrageBot:
             for entry in data:
                 sym = entry["symbol"]
                 price_dict[sym] = {"bid": float(entry["bidPrice"]), "ask": float(entry["askPrice"])}
-            # Removed detailed batch timing logs to reduce noise
         except Exception as e:
             print(f"[{datetime.now()}] Warning: Failed to fetch batch prices from {url} symbols count {len(symbol_list)}: {e}")
 
@@ -144,7 +143,6 @@ class ArbitrageBot:
             print("No arbitrage candidates found.")
             self.candidate_coins = []
             self.candidate_track_start = None
-            # Immediately after no candidates, full scan will happen again in monitor loop
 
     def open_trade(self, strategy, coin):
         sym = coin["symbol"]
@@ -199,7 +197,6 @@ class ArbitrageBot:
                        futures_fee=fut_fee)
         del strategy.positions[sym]
         self.save_logs(strategy)
-        self.full_market_scan()
 
     def log_trade(self, strategy, sym, action, ts, sp, fp, sp_qty, fp_qty, sp_fee, fp_fee, pnl,
                   entry_time=None, entry_spot_price=None, entry_futures_price=None, gross_pnl=None, spot_fee=None,
@@ -253,9 +250,20 @@ class ArbitrageBot:
         upload_to_gdrive(csv_name)
 
     def monitor_loop(self):
+        premium_print_timer = datetime.now()
         while not self.stop_event.is_set():
             now = datetime.now()
             self.fetch_prices()
+            # Print premium difference every 2 seconds
+            if (now - premium_print_timer).total_seconds() >= 2:
+                print(f"\n[{now}] Candidate premium differences:")
+                for c in self.candidate_coins:
+                    sp = self.spot_prices.get(c['symbol'])
+                    fp = self.futures_prices.get(c['symbol'])
+                    if sp and fp:
+                        diff = (fp['bid'] - sp['ask']) / sp['ask'] * 100
+                        print(f"  {c['symbol']} premium diff: {diff:.4f}%")
+                premium_print_timer = now
             for strategy in self.strategies:
                 if strategy.positions:
                     for sym in list(strategy.positions.keys()):
