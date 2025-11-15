@@ -11,11 +11,11 @@ def now_ist():
     return datetime.utcnow() + timedelta(hours=5, minutes=30)
 
 STRATEGIES = [
-    {'name': 'Strategy_1', 'entry_diff': 0.30, 'exit_diff': 0.0},
-    {'name': 'Strategy_2', 'entry_diff': 0.20, 'exit_diff': -0.20},
-    {'name': 'Strategy_3', 'entry_diff': 0.20, 'exit_diff': -0.25},
-    {'name': 'Strategy_4', 'entry_diff': 0.12, 'exit_diff': -0.24},
-    {'name': 'Strategy_5', 'entry_diff': 0.25, 'exit_diff': -0.25, 'safety_timeout': 60 * 60}
+    {'name': 'Strategy_1', 'entry_diff': 0.30,  'exit_diff': 0.0},
+    {'name': 'Strategy_2', 'entry_diff': 0.20,  'exit_diff': -0.20},
+    {'name': 'Strategy_3', 'entry_diff': 0.20,  'exit_diff': -0.25},
+    {'name': 'Strategy_4', 'entry_diff': 0.12,  'exit_diff': -0.24},
+    {'name': 'Strategy_5', 'entry_diff': 0.25,  'exit_diff': -0.25, 'safety_timeout': 60 * 60}
 ]
 
 MAX_BATCH_SIZE = 50
@@ -78,6 +78,7 @@ class ArbitrageBot:
 
         self.spot_prices = {}
         self.futures_prices = {}
+        self.watchlist = set()  # Symbols to monitor prices for in current phase
 
     def fetch_symbols(self):
         spot_info = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=5).json()
@@ -86,6 +87,8 @@ class ArbitrageBot:
         self.futures_symbols = [s["symbol"] for s in futures_info["symbols"] if s["contractType"] == "PERPETUAL" and s["status"] == "TRADING" and s["quoteAsset"] == "USDT"]
 
     def fetch_batch_prices(self, url, symbol_list, price_dict):
+        if not symbol_list:
+            return
         params = {"symbols": f'["{"\",\"".join(symbol_list)}"]'}
         try:
             resp = requests.get(url, params=params, timeout=5)
@@ -98,29 +101,39 @@ class ArbitrageBot:
             print(f"[{now_ist()}] Warning: Failed to fetch batch prices from {url} symbols count {len(symbol_list)}: {e}")
 
     def fetch_prices(self):
-        watch_symbols_set = set()
-        for strategy in self.strategies:
-            watch_symbols_set.update(strategy.positions.keys())
-        watch_symbols_set.update([c['symbol'] for c in self.candidate_coins])
-        if not watch_symbols_set:
-            return
-        watch_symbols = list(watch_symbols_set)
-        spot_watch = [sym for sym in watch_symbols if sym in self.spot_symbols]
-        futures_watch = [sym for sym in watch_symbols if sym in self.futures_symbols]
-
         def chunks(lst, n):
             for i in range(0, len(lst), n):
                 yield lst[i:i + n]
 
-        spot_batches = list(chunks(spot_watch, MAX_BATCH_SIZE))
-        futures_batches = list(chunks(futures_watch, MAX_BATCH_SIZE))
+        # Build watchlist for current monitoring phase
+        trade_symbols = set()
+        for strategy in self.strategies:
+            trade_symbols.update(strategy.positions.keys())
+
+        if self.candidate_coins:
+            # During candidate tracking phase: track all candidates + open trades
+            watchlist = set([c['symbol'] for c in self.candidate_coins]) | trade_symbols
+        else:
+            # Otherwise full scan phase: monitor all futures symbols
+            watchlist = set(self.futures_symbols)
+
+        self.watchlist = watchlist
+
+        spot_symbols = [sym for sym in self.spot_symbols if sym in watchlist]
+        futures_symbols = [sym for sym in self.futures_symbols if sym in watchlist]
+
+        spot_url = "https://api.binance.com/api/v3/ticker/bookTicker"
+        futures_url = "https://fapi.binance.com/fapi/v1/ticker/bookTicker"
+
+        spot_batches = list(chunks(spot_symbols, MAX_BATCH_SIZE))
+        futures_batches = list(chunks(futures_symbols, MAX_BATCH_SIZE))
 
         with ThreadPoolExecutor(max_workers=10) as executor:
             for batch in spot_batches:
-                executor.submit(self.fetch_batch_prices, "https://api.binance.com/api/v3/ticker/bookTicker", batch, self.spot_prices)
+                executor.submit(self.fetch_batch_prices, spot_url, batch, self.spot_prices)
                 time.sleep(1.0 / 18)
             for batch in futures_batches:
-                executor.submit(self.fetch_batch_prices, "https://fapi.binance.com/fapi/v1/ticker/bookTicker", batch, self.futures_prices)
+                executor.submit(self.fetch_batch_prices, futures_url, batch, self.futures_prices)
                 time.sleep(1.0 / 18)
 
     def full_market_scan(self):
@@ -263,6 +276,18 @@ class ArbitrageBot:
         while not self.stop_event.is_set():
             now = now_ist()
 
+            # Check candidate tracking window state
+            in_candidate_tracking = False
+            if self.candidate_coins and self.candidate_track_start:
+                elapsed = (now - self.candidate_track_start).total_seconds()
+                if elapsed < self.CANDIDATE_TRACK_TIME:
+                    in_candidate_tracking = True
+                else:
+                    print(f"{now} Candidate tracking expired, rescanning full market")
+                    self.candidate_coins = []
+                    self.candidate_track_start = None
+
+            # Fetch prices - will adapt watchlist based on current state
             self.fetch_prices()
 
             if (now - premium_print_timer).total_seconds() >= 2:
@@ -275,32 +300,29 @@ class ArbitrageBot:
                         print(f"  {c['symbol']} premium diff: {diff:.4f}%")
                 premium_print_timer = now
 
-            if not self.candidate_coins:
+            if not in_candidate_tracking:
+                # Full scan phase: find candidates, loop continues to track them next
                 self.full_market_scan()
                 continue
 
-            elapsed = (now - self.candidate_track_start).total_seconds() if self.candidate_track_start else 0
-
-            if elapsed > self.CANDIDATE_TRACK_TIME:
-                print(f"{now} Candidate tracking expired, rescanning full market")
-                self.full_market_scan()
-                continue
-
+            # Candidate tracking phase: monitor candidates AND open trades concurrently
             for strategy in self.strategies:
+                # Check existing open positions for exit conditions
                 if strategy.positions:
                     for sym in list(strategy.positions.keys()):
                         sp = self.spot_prices.get(sym)
                         fp = self.futures_prices.get(sym)
-                        diff_pct = None
                         if sp and fp:
                             diff_pct = (fp["bid"] - sp["ask"]) / sp["ask"] * 100
                             entry_time = strategy.positions[sym]['entry_time']
-                            if diff_pct is not None and diff_pct <= strategy.exit_diff:
+                            if diff_pct <= strategy.exit_diff:
                                 print(f"[{strategy.strategy_name}] {now} | Premium ≤ {strategy.exit_diff}% on {sym}, exiting trade.")
                                 self.close_trade(strategy, sym)
                             elif (now - entry_time).total_seconds() > strategy.safety_timeout:
                                 print(f"[{strategy.strategy_name}] {now} | Safety timeout reached on {sym}, exiting trade.")
                                 self.close_trade(strategy, sym)
+
+                # For candidates without open trades, check entry conditions and open trades
                 else:
                     for c in self.candidate_coins:
                         sym = c["symbol"]
@@ -310,14 +332,16 @@ class ArbitrageBot:
                             continue
                         diff_pct = (fp["bid"] - sp["ask"]) / sp["ask"] * 100
                         if diff_pct >= strategy.entry_diff:
-                            print(f"[{strategy.strategy_name}] {now} | Opening trade on {sym}, premium {diff_pct:.4f}%")
-                            self.open_trade(strategy, {
-                                "symbol": sym,
-                                "spot_price": sp["ask"],
-                                "futures_price": fp["bid"],
-                                "diff": diff_pct
-                            })
-                            break
+                            # Ensure no open trade on this symbol for this strategy before entry
+                            if sym not in strategy.positions:
+                                print(f"[{strategy.strategy_name}] {now} | Opening trade on {sym}, premium {diff_pct:.4f}%")
+                                self.open_trade(strategy, {
+                                    "symbol": sym,
+                                    "spot_price": sp["ask"],
+                                    "futures_price": fp["bid"],
+                                    "diff": diff_pct
+                                })
+                                break
 
             time.sleep(0.01)
 
