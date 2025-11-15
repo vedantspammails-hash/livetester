@@ -1,3 +1,4 @@
+import os
 import requests
 import time
 from datetime import datetime, timedelta, timezone
@@ -8,7 +9,6 @@ from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 
 def now_ist():
-    # Timezone-aware IST time
     return datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
 
 STRATEGIES = [
@@ -21,13 +21,23 @@ STRATEGIES = [
 
 MAX_BATCH_SIZE = 50
 
+def write_creds_file():
+    creds_content = os.getenv("MYCREDS_TXT")
+    if creds_content:
+        with open("mycreds.txt", "w") as f:
+            f.write(creds_content)
+        print("mycreds.txt written from environment variable.")
+    else:
+        print("Warning: MYCREDS_TXT environment variable not found. Google Drive upload will fail.")
+
 def upload_to_gdrive(local_file_path):
     try:
+        write_creds_file()  # Ensure creds file written before auth
+
         gauth = GoogleAuth()
         gauth.LoadCredentialsFile("mycreds.txt")
         if gauth.credentials is None:
-            # Use CommandLineAuth for headless/cloud environments
-            gauth.CommandLineAuth()
+            gauth.LocalWebserverAuth()  # This will open a local browser if run locally
         elif gauth.access_token_expired:
             gauth.Refresh()
         else:
@@ -58,7 +68,7 @@ class ArbitrageBotStrategy:
         self.entry_diff = entry_diff
         self.exit_diff = exit_diff
         self.strategy_name = strategy_name
-        self.positions = {}  # key: symbol, value: position dict
+        self.positions = {}
         self.trade_log = []
         self.safety_timeout = safety_timeout or 30 * 60
 
@@ -66,9 +76,8 @@ class ArbitrageBot:
     def __init__(self):
         self.strategies = [ArbitrageBotStrategy(s.get('entry_diff'), s.get('exit_diff'), s.get('name'), s.get('safety_timeout')) for s in STRATEGIES]
         self.candidate_coins = []
-        self.CANDIDATE_TRACK_TIME = 2 * 60  # seconds
+        self.CANDIDATE_TRACK_TIME = 120
         self.candidate_track_start = None
-        self.last_full_scan_time = None
         self.SPOT_FEE_RATE = 0.001
         self.FUTURES_FEE_RATE = 0.0004
         self.TRADE_AMOUNT_USD = 100
@@ -100,7 +109,7 @@ class ArbitrageBot:
                 sym = entry["symbol"]
                 price_dict[sym] = {"bid": float(entry["bidPrice"]), "ask": float(entry["askPrice"])}
         except Exception as e:
-            print(f"[{now_ist()}] Warning: Failed to fetch batch prices from {url} symbols count {len(symbol_list)}: {e}")
+            print(f"[{now_ist()}] Warning: Failed batch fetch {len(symbol_list)}: {e}")
 
     def fetch_prices(self):
         def chunks(lst, n):
@@ -112,10 +121,8 @@ class ArbitrageBot:
             trade_symbols.update(strategy.positions.keys())
 
         if self.candidate_coins:
-            # Track all candidates + open trades during candidate tracking
             watchlist = set([c['symbol'] for c in self.candidate_coins]) | trade_symbols
         else:
-            # Full market scan phase watch all futures symbols
             watchlist = set(self.futures_symbols)
 
         self.watchlist = watchlist
@@ -132,7 +139,7 @@ class ArbitrageBot:
         with ThreadPoolExecutor(max_workers=10) as executor:
             for batch in spot_batches:
                 executor.submit(self.fetch_batch_prices, spot_url, batch, self.spot_prices)
-                time.sleep(1.0 / 18)  # Respect API limits
+                time.sleep(1.0 / 18)
             for batch in futures_batches:
                 executor.submit(self.fetch_batch_prices, futures_url, batch, self.futures_prices)
                 time.sleep(1.0 / 18)
@@ -160,18 +167,14 @@ class ArbitrageBot:
                 print(f"  {c['symbol']} | Spot ask: {c['spot_price']:.5f}, Futures bid: {c['futures_price']:.5f}, Diff%: {c['diff']:.4f}")
             self.candidate_coins = candidates
             self.candidate_track_start = now
-            self.last_full_scan_time = now
         else:
             print("No arbitrage candidates found.")
             self.candidate_coins = []
             self.candidate_track_start = None
-            self.last_full_scan_time = now
 
     def open_trade(self, strategy, coin):
-        # Block new trade if strategy already has ANY open position
-        if strategy.positions:
+        if strategy.positions:  # block multiple trades per strategy
             return
-
         sym = coin["symbol"]
         spot_price = coin["spot_price"]
         fut_price = coin["futures_price"]
@@ -186,8 +189,8 @@ class ArbitrageBot:
             "futures_qty": fut_qty
         }
         print(f"\n[{strategy.strategy_name}] {ts} | Opened trade on {sym}")
-        print(f"  Spot buy @ {spot_price:.5f} (ask) qty: {spot_qty:.4f}")
-        print(f"  Futures short @ {fut_price:.5f} (bid) qty: {fut_qty:.4f}")
+        print(f"  Spot buy @ {spot_price:.5f} qty: {spot_qty:.4f}")
+        print(f"  Futures short @ {fut_price:.5f} qty: {fut_qty:.4f}")
         self.log_trade(strategy, sym, "ENTRY", ts, spot_price, fut_price, spot_qty, fut_qty, 0, 0, 0)
 
     def close_trade(self, strategy, sym):
@@ -211,17 +214,14 @@ class ArbitrageBot:
         total_fees = spot_fee + fut_fee
         net_pnl = gross_pnl - total_fees
         print(f"\n[{strategy.strategy_name}] {ts} | Closed trade on {sym}")
-        print(f"  Spot sell @ {sp_current:.5f} (bid), Futures cover @ {fp_current:.5f} (ask)")
+        print(f"  Spot sell @ {sp_current:.5f}, Futures cover @ {fp_current:.5f}")
         print(f"  Gross P&L: Spot: {pnl_spot:.4f} + Futures: {pnl_fut:.4f} = Total: {gross_pnl:.4f}")
         print(f"  Fees: Spot: {spot_fee:.4f}, Futures: {fut_fee:.4f}")
         print(f"  Net P&L after fees: {net_pnl:.4f}")
         self.log_trade(strategy, sym, "EXIT", ts, sp_current, fp_current, spot_qty, fut_qty, total_fees, total_fees, net_pnl,
-                       entry_time=pos["entry_time"],
-                       entry_spot_price=spot_entry,
-                       entry_futures_price=fut_entry,
-                       gross_pnl=gross_pnl,
-                       spot_fee=spot_fee,
-                       futures_fee=fut_fee)
+                       entry_time=pos["entry_time"], entry_spot_price=spot_entry,
+                       entry_futures_price=fut_entry, gross_pnl=gross_pnl,
+                       spot_fee=spot_fee, futures_fee=fut_fee)
         del strategy.positions[sym]
         self.save_logs(strategy)
 
@@ -229,45 +229,33 @@ class ArbitrageBot:
                   entry_time=None, entry_spot_price=None, entry_futures_price=None, gross_pnl=None,
                   spot_fee=None, futures_fee=None):
         log_entry = {
-            "symbol": sym,
-            "action": action,
-            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
-            "spot_price": sp,
-            "futures_price": fp,
-            "spot_qty": sp_qty,
-            "futures_qty": fp_qty,
-            "spot_fee": sp_fee,
-            "futures_fee": fp_fee,
-            "pnl": pnl
+            "symbol": sym, "action": action, "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+            "spot_price": sp, "futures_price": fp, "spot_qty": sp_qty, "futures_qty": fp_qty,
+            "spot_fee": sp_fee, "futures_fee": fp_fee, "pnl": pnl
         }
         if action == "EXIT":
             log_entry.update({
                 "entry_time": entry_time.strftime("%Y-%m-%d %H:%M:%S") if entry_time else "",
-                "entry_spot_price": entry_spot_price,
-                "entry_futures_price": entry_futures_price,
-                "gross_pnl": gross_pnl,
-                "spot_fee_detail": spot_fee,
-                "futures_fee_detail": futures_fee,
-                "net_pnl": pnl
+                "entry_spot_price": entry_spot_price, "entry_futures_price": entry_futures_price,
+                "gross_pnl": gross_pnl, "spot_fee_detail": spot_fee,
+                "futures_fee_detail": futures_fee, "net_pnl": pnl
             })
         else:
             log_entry.update({
-                "entry_time": "",
-                "entry_spot_price": None,
-                "entry_futures_price": None,
-                "gross_pnl": None,
-                "spot_fee_detail": None,
-                "futures_fee_detail": None,
+                "entry_time": "", "entry_spot_price": None,
+                "entry_futures_price": None, "gross_pnl": None,
+                "spot_fee_detail": None, "futures_fee_detail": None,
                 "net_pnl": None
             })
         strategy.trade_log.append(log_entry)
 
     def save_logs(self, strategy):
         df = pd.DataFrame(strategy.trade_log)
-        column_order = ["symbol", "action", "entry_time", "timestamp", "entry_spot_price", "entry_futures_price",
-                        "spot_price", "futures_price", "spot_qty", "futures_qty",
-                        "gross_pnl", "spot_fee_detail", "futures_fee_detail", "spot_fee", "futures_fee", "pnl", "net_pnl"]
-        df = df.reindex(columns=column_order)
+        columns_order = ["symbol", "action", "entry_time", "timestamp", "entry_spot_price", "entry_futures_price",
+                         "spot_price", "futures_price", "spot_qty", "futures_qty",
+                         "gross_pnl", "spot_fee_detail", "futures_fee_detail",
+                         "spot_fee", "futures_fee", "pnl", "net_pnl"]
+        df = df.reindex(columns=columns_order)
         excel_name = f"trade_log_{strategy.strategy_name}.xlsx"
         csv_name = f"trade_log_{strategy.strategy_name}_backup.csv"
         df.to_excel(excel_name, index=False)
@@ -296,8 +284,7 @@ class ArbitrageBot:
             if (now - premium_print_timer).total_seconds() >= 2:
                 print(f"\n[{now}] Candidate premium differences:")
                 for c in self.candidate_coins:
-                    sp = self.spot_prices.get(c['symbol'])
-                    fp = self.futures_prices.get(c['symbol'])
+                    sp, fp = self.spot_prices.get(c['symbol']), self.futures_prices.get(c['symbol'])
                     if sp and fp:
                         diff = (fp['bid'] - sp['ask']) / sp['ask'] * 100
                         print(f"  {c['symbol']} premium diff: {diff:.4f}%")
@@ -308,11 +295,9 @@ class ArbitrageBot:
                 continue
 
             for strategy in self.strategies:
-                # Close trades if exit or safety timeout triggered
                 if strategy.positions:
                     for sym in list(strategy.positions.keys()):
-                        sp = self.spot_prices.get(sym)
-                        fp = self.futures_prices.get(sym)
+                        sp, fp = self.spot_prices.get(sym), self.futures_prices.get(sym)
                         if sp and fp:
                             diff_pct = (fp["bid"] - sp["ask"]) / sp["ask"] * 100
                             entry_time = strategy.positions[sym]['entry_time']
@@ -322,23 +307,18 @@ class ArbitrageBot:
                             elif (now - entry_time).total_seconds() > strategy.safety_timeout:
                                 print(f"[{strategy.strategy_name}] {now} | Safety timeout reached on {sym}, exiting trade.")
                                 self.close_trade(strategy, sym)
-
-                # Open trades only if no open position in strategy (one position max)
                 elif not strategy.positions:
                     for c in self.candidate_coins:
                         sym = c["symbol"]
-                        sp = self.spot_prices.get(sym)
-                        fp = self.futures_prices.get(sym)
+                        sp, fp = self.spot_prices.get(sym), self.futures_prices.get(sym)
                         if not sp or not fp:
                             continue
                         diff_pct = (fp["bid"] - sp["ask"]) / sp["ask"] * 100
                         if diff_pct >= strategy.entry_diff:
                             print(f"[{strategy.strategy_name}] {now} | Opening trade on {sym}, premium {diff_pct:.4f}%")
                             self.open_trade(strategy, {
-                                "symbol": sym,
-                                "spot_price": sp["ask"],
-                                "futures_price": fp["bid"],
-                                "diff": diff_pct
+                                "symbol": sym, "spot_price": sp["ask"],
+                                "futures_price": fp["bid"], "diff": diff_pct
                             })
                             break
 
