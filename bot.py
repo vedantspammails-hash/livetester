@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 
-# Function to get IST datetime now
 def now_ist():
     return datetime.utcnow() + timedelta(hours=5, minutes=30)
 
@@ -20,8 +19,6 @@ STRATEGIES = [
 ]
 
 MAX_BATCH_SIZE = 50
-MAX_CALLS_PER_SECOND = 18
-CALL_DELAY = 1.0 / MAX_CALLS_PER_SECOND
 
 def upload_to_gdrive(local_file_path):
     try:
@@ -67,7 +64,7 @@ class ArbitrageBot:
     def __init__(self):
         self.strategies = [ArbitrageBotStrategy(s.get('entry_diff'), s.get('exit_diff'), s.get('name'), s.get('safety_timeout')) for s in STRATEGIES]
         self.candidate_coins = []
-        self.CANDIDATE_TRACK_TIME = 2 * 60  # seconds
+        self.CANDIDATE_TRACK_TIME = 2 * 60
         self.candidate_track_start = None
         self.last_full_scan_time = None
         self.SPOT_FEE_RATE = 0.001
@@ -85,10 +82,8 @@ class ArbitrageBot:
     def fetch_symbols(self):
         spot_info = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=5).json()
         futures_info = requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=5).json()
-        self.spot_symbols = [s["symbol"] for s in spot_info["symbols"]
-                             if s["status"] == "TRADING" and s["quoteAsset"] == "USDT"]
-        self.futures_symbols = [s["symbol"] for s in futures_info["symbols"]
-                               if s["contractType"] == "PERPETUAL" and s["status"] == "TRADING" and s["quoteAsset"] == "USDT"]
+        self.spot_symbols = [s["symbol"] for s in spot_info["symbols"] if s["status"] == "TRADING" and s["quoteAsset"] == "USDT"]
+        self.futures_symbols = [s["symbol"] for s in futures_info["symbols"] if s["contractType"] == "PERPETUAL" and s["status"] == "TRADING" and s["quoteAsset"] == "USDT"]
 
     def fetch_batch_prices(self, url, symbol_list, price_dict):
         params = {"symbols": f'["{"\",\"".join(symbol_list)}"]'}
@@ -116,10 +111,10 @@ class ArbitrageBot:
         with ThreadPoolExecutor(max_workers=10) as executor:
             for batch in spot_batches:
                 executor.submit(self.fetch_batch_prices, spot_url, batch, self.spot_prices)
-                time.sleep(CALL_DELAY)
+                time.sleep(1.0 / 18)  # Delay to respect rate limits
             for batch in futures_batches:
                 executor.submit(self.fetch_batch_prices, futures_url, batch, self.futures_prices)
-                time.sleep(CALL_DELAY)
+                time.sleep(1.0 / 18)
 
     def full_market_scan(self):
         now = now_ist()
@@ -148,8 +143,8 @@ class ArbitrageBot:
         else:
             print("No arbitrage candidates found.")
             self.candidate_coins = []
-            # Set candidate tracking time but don't update last scan time to allow immediate rescans
-            self.candidate_track_start = now
+            self.candidate_track_start = None
+            self.last_full_scan_time = now
 
     def open_trade(self, strategy, coin):
         sym = coin["symbol"]
@@ -206,8 +201,8 @@ class ArbitrageBot:
         self.save_logs(strategy)
 
     def log_trade(self, strategy, sym, action, ts, sp, fp, sp_qty, fp_qty, sp_fee, fp_fee, pnl,
-                  entry_time=None, entry_spot_price=None, entry_futures_price=None, gross_pnl=None, spot_fee=None,
-                  futures_fee=None):
+                  entry_time=None, entry_spot_price=None, entry_futures_price=None, gross_pnl=None,
+                  spot_fee=None, futures_fee=None):
         log_entry = {
             "symbol": sym,
             "action": action,
@@ -260,6 +255,7 @@ class ArbitrageBot:
         premium_print_timer = now_ist()
         while not self.stop_event.is_set():
             now = now_ist()
+
             self.fetch_prices()
 
             if (now - premium_print_timer).total_seconds() >= 2:
@@ -271,6 +267,17 @@ class ArbitrageBot:
                         diff = (fp['bid'] - sp['ask']) / sp['ask'] * 100
                         print(f"  {c['symbol']} premium diff: {diff:.4f}%")
                 premium_print_timer = now
+
+            if not self.candidate_coins:
+                self.full_market_scan()
+                continue
+
+            elapsed = (now - self.candidate_track_start).total_seconds() if self.candidate_track_start else 0
+
+            if elapsed > self.CANDIDATE_TRACK_TIME:
+                print(f"{now} Candidate tracking expired, rescanning full market")
+                self.full_market_scan()
+                continue
 
             for strategy in self.strategies:
                 if strategy.positions:
@@ -288,37 +295,23 @@ class ArbitrageBot:
                                 print(f"[{strategy.strategy_name}] {now} | Safety timeout reached on {sym}, exiting trade.")
                                 self.close_trade(strategy, sym)
                 else:
-                    if not self.candidate_coins:
-                        # Full scan immediately if empty
-                        self.full_market_scan()
-                        continue
-                    else:
-                        elapsed = (now - self.candidate_track_start).total_seconds() if self.candidate_track_start else 0
-                        # Enforce cooldown between full scans only if candidates exist
-                        if self.last_full_scan_time:
-                            diff_since_last_scan = (now - self.last_full_scan_time).total_seconds()
-                        else:
-                            diff_since_last_scan = None
-                        if elapsed > self.CANDIDATE_TRACK_TIME and (diff_since_last_scan is None or diff_since_last_scan >= self.CANDIDATE_TRACK_TIME):
-                            print(f"{now} Candidate tracking expired, rescanning full market")
-                            self.full_market_scan()
+                    for c in self.candidate_coins:
+                        sym = c["symbol"]
+                        sp = self.spot_prices.get(sym)
+                        fp = self.futures_prices.get(sym)
+                        if not sp or not fp:
                             continue
-                        for c in self.candidate_coins:
-                            sym = c["symbol"]
-                            sp = self.spot_prices.get(sym)
-                            fp = self.futures_prices.get(sym)
-                            if not sp or not fp:
-                                continue
-                            diff_pct = (fp["bid"] - sp["ask"]) / sp["ask"] * 100
-                            if len(strategy.positions) == 0 and diff_pct >= strategy.entry_diff:
-                                print(f"[{strategy.strategy_name}] {now} | Opening trade on {sym}, premium {diff_pct:.4f}%")
-                                self.open_trade(strategy, {
-                                    "symbol": sym,
-                                    "spot_price": sp["ask"],
-                                    "futures_price": fp["bid"],
-                                    "diff": diff_pct
-                                })
-                                break
+                        diff_pct = (fp["bid"] - sp["ask"]) / sp["ask"] * 100
+                        if diff_pct >= strategy.entry_diff:
+                            print(f"[{strategy.strategy_name}] {now} | Opening trade on {sym}, premium {diff_pct:.4f}%")
+                            self.open_trade(strategy, {
+                                "symbol": sym,
+                                "spot_price": sp["ask"],
+                                "futures_price": fp["bid"],
+                                "diff": diff_pct
+                            })
+                            break
+
             time.sleep(0.01)
 
     def run(self):
@@ -332,7 +325,6 @@ class ArbitrageBot:
             print(f"Exiting and saving logs... {now_ist()}")
             for strategy in self.strategies:
                 self.save_logs(strategy)
-
 
 if __name__ == "__main__":
     bot = ArbitrageBot()
