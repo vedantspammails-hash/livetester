@@ -4,14 +4,32 @@ from datetime import datetime, timedelta
 import pandas as pd
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 
 STRATEGIES = [
-    {'name': 'Strategy_1', 'entry_diff': 0.30,  'exit_diff': 0.0},    # Entry: +0.3%, Exit: ≤0%
-    {'name': 'Strategy_2', 'entry_diff': 0.20,  'exit_diff': -0.20},  # Entry: +0.2%, Exit: ≤-0.2%
-    {'name': 'Strategy_3', 'entry_diff': 0.20,  'exit_diff': -0.25},  # Entry: +0.2%, Exit: ≤-0.25%
-    {'name': 'Strategy_4', 'entry_diff': 0.12,  'exit_diff': -0.24},  # Entry: +0.12%, Exit: ≤-0.24%
-    {'name': 'Strategy_5', 'entry_diff': 0.25,  'exit_diff': -0.25},  # NEW: Entry: +0.25%, Exit: ≤-0.25%
+    {'name': 'Strategy_1', 'entry_diff': 0.30,  'exit_diff': 0.0},
+    {'name': 'Strategy_2', 'entry_diff': 0.20,  'exit_diff': -0.20},
+    {'name': 'Strategy_3', 'entry_diff': 0.20,  'exit_diff': -0.25},
+    {'name': 'Strategy_4', 'entry_diff': 0.12,  'exit_diff': -0.24},
+    {'name': 'Strategy_5', 'entry_diff': 0.25,  'exit_diff': -0.25},
 ]
+
+class RateLimiter:
+    def __init__(self, rate_per_sec):
+        self.rate_per_sec = rate_per_sec
+        self.lock = Lock()
+        self.last_called = 0.0
+
+    def wait(self):
+        with self.lock:
+            now = time.time()
+            elapsed = now - self.last_called
+            wait_time = max(0, 1.0 / self.rate_per_sec - elapsed)
+            if wait_time > 0:
+                time.sleep(wait_time)
+            self.last_called = time.time()
+
+rate_limiter = RateLimiter(rate_per_sec=12)  # ~12 req/sec for futures API
 
 class ArbitrageBotStrategy:
     def __init__(self, entry_diff, exit_diff, strategy_name):
@@ -25,12 +43,12 @@ class ArbitrageBot:
     def __init__(self):
         self.strategies = [ArbitrageBotStrategy(s['entry_diff'], s['exit_diff'], s['name']) for s in STRATEGIES]
         self.candidate_coins = []
-        self.CANDIDATE_TRACK_TIME = 2 * 60  # 2 minutes tracking window
+        self.CANDIDATE_TRACK_TIME = 2 * 60
         self.candidate_track_start = None
-        self.SPOT_FEE_RATE = 0.001  # 0.1%
-        self.FUTURES_FEE_RATE = 0.0004  # 0.04%
+        self.SPOT_FEE_RATE = 0.001
+        self.FUTURES_FEE_RATE = 0.0004
         self.TRADE_AMOUNT_USD = 100
-        self.MIN_SCAN_DIFF_PERCENT = 0.10  # Scan threshold 0.1%
+        self.MIN_SCAN_DIFF_PERCENT = 0.10
         self.stop_event = threading.Event()
 
         self.spot_symbols = []
@@ -39,7 +57,6 @@ class ArbitrageBot:
         self.spot_prices = {}
         self.futures_prices = {}
 
-        # Funding info: dict symbol -> dict with 'interval_hours', 'next_funding_time', 'last_funding_applied_time', 'last_funding_rate'
         self.funding_info = {}
 
     def fetch_symbols(self):
@@ -83,6 +100,7 @@ class ArbitrageBot:
     def fetch_batch_prices(self, url, symbol_list, price_dict):
         if not symbol_list:
             return
+        rate_limiter.wait()
         params = {"symbols": f'["{"\",\"".join(symbol_list)}"]'}
         try:
             resp = requests.get(url, params=params, timeout=5)
@@ -95,32 +113,30 @@ class ArbitrageBot:
             print(f"[{datetime.now()}] Warning: Failed to fetch batch prices from {url} symbols count {len(symbol_list)}: {e}")
 
     def fetch_prices_for_symbols(self, symbols_to_fetch):
-        # Fetch prices only for required symbols (subset of spot and futures symbols)
         spot_list = [sym for sym in symbols_to_fetch if sym in self.spot_symbols]
         futures_list = [sym for sym in symbols_to_fetch if sym in self.futures_symbols]
 
         spot_url = "https://api.binance.com/api/v3/ticker/bookTicker"
         futures_url = "https://fapi.binance.com/fapi/v1/ticker/bookTicker"
 
-        # Batch and thread fetching
         def chunks(lst, n):
             for i in range(0, len(lst), n):
                 yield lst[i:i + n]
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        max_workers_spot = 5
+        max_workers_futures = 3
+
+        with ThreadPoolExecutor(max_workers=max_workers_spot) as executor:
             spot_batches = list(chunks(spot_list, 50))
-            futures_batches = list(chunks(futures_list, 50))
-
             spot_futures = [executor.submit(self.fetch_batch_prices, spot_url, batch, self.spot_prices) for batch in spot_batches]
-            futures_futures = [executor.submit(self.fetch_batch_prices, futures_url, batch, self.futures_prices) for batch in futures_batches]
-
             for f in spot_futures:
                 f.result()
-                time.sleep(0.01)
 
+        with ThreadPoolExecutor(max_workers=max_workers_futures) as executor:
+            futures_batches = list(chunks(futures_list, 50))
+            futures_futures = [executor.submit(self.fetch_batch_prices, futures_url, batch, self.futures_prices) for batch in futures_batches]
             for f in futures_futures:
                 f.result()
-                time.sleep(0.01)
 
         now = datetime.now()
         if not hasattr(self, "_last_funding_info_fetch") or (now - self._last_funding_info_fetch).seconds > 60:
@@ -131,7 +147,6 @@ class ArbitrageBot:
         now = datetime.now()
         print(f"\n{now} - Running full market scan on live prices...")
         candidates = []
-        # Fetch full prices for all symbols before scan
         self.fetch_prices_for_symbols(self.futures_symbols + self.spot_symbols)
 
         for sym in self.futures_symbols:
@@ -236,7 +251,6 @@ class ArbitrageBot:
                        funding_fee=funding_fee_accumulated)
         del strategy.positions[sym]
         self.save_logs(strategy)
-        # After closing a trade, re-run full scan to update candidates and watchlist
         self.full_market_scan()
 
     def log_trade(self, strategy, sym, action, ts, sp, fp, sp_qty, fp_qty, sp_fee, fp_fee, pnl,
@@ -320,10 +334,8 @@ class ArbitrageBot:
         while not self.stop_event.is_set():
             now = datetime.now()
 
-            # Always monitor open trades:
             for strategy in self.strategies:
                 if strategy.positions:
-                    # Fetch prices for all open positions symbols only here to reduce API calls
                     open_positions_syms = list(strategy.positions.keys())
                     self.fetch_prices_for_symbols(open_positions_syms)
 
@@ -340,20 +352,16 @@ class ArbitrageBot:
                             print(f"[{strategy.strategy_name}] {now} | Premium ≤ {strategy.exit_diff}% on {sym}, exiting trade.")
                             self.close_trade(strategy, sym)
 
-            # Candidate monitoring and scanning logic:
             tracking_active = False
             if self.candidate_coins and self.candidate_track_start:
                 elapsed = (now - self.candidate_track_start).total_seconds()
                 if elapsed < self.CANDIDATE_TRACK_TIME:
                     tracking_active = True
                 else:
-                    # Candidate tracking expired, clear watchlist to trigger full scan
                     self.candidate_coins = []
                     self.candidate_track_start = None
 
             if tracking_active:
-                # During candidate tracking window: only monitor candidate coins + open positions
-                # Collect symbols to monitor: candidate coins' symbols + open positions' symbols (all strategies)
                 monitor_syms = set(c['symbol'] for c in self.candidate_coins)
                 for strat in self.strategies:
                     monitor_syms.update(strat.positions.keys())
@@ -361,7 +369,6 @@ class ArbitrageBot:
 
                 self.fetch_prices_for_symbols(monitor_syms)
 
-                # For entry condition, for each strategy if no position open, check candidate coins:
                 for strategy in self.strategies:
                     if len(strategy.positions) == 0:
                         for c in self.candidate_coins:
@@ -370,7 +377,7 @@ class ArbitrageBot:
                             fp = self.futures_prices.get(sym)
                             if not sp or not fp:
                                 continue
-                            diff_pct = (fp["bid"] - sp["ask"]) / sp["ask"] * 100  # entry premium
+                            diff_pct = (fp["bid"] - sp["ask"]) / sp["ask"] * 100
                             if diff_pct >= strategy.entry_diff:
                                 print(f"[{strategy.strategy_name}] {now} | Opening trade on {sym}, premium {diff_pct:.4f}%")
                                 self.open_trade(strategy, {
@@ -379,15 +386,12 @@ class ArbitrageBot:
                                     "futures_price": fp["bid"],
                                     "diff": diff_pct
                                 })
-                                break  # only one open trade per strategy
+                                break
 
-                # Wait briefly to reduce rate limit risk
                 time.sleep(0.1)
 
             else:
-                # No active candidate tracking — do full market scan immediately to find candidates
                 self.full_market_scan()
-                # Wait briefly to reduce API call rate
                 time.sleep(0.1)
 
     def run(self):
